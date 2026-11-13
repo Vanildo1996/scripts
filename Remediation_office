@@ -1,0 +1,180 @@
+﻿<#
+.SYNOPSIS
+    Intune Remediation - REMEDIATION
+    1. Identifica canal/versão e busca a última versão do canal
+    2. Avisa o usuário que o Office será fechado (contagem regressiva)
+    3. Fecha os apps do Office
+    4. Força a atualização (OfficeC2RClient) para a versão alvo
+    5. Aguarda a conclusão, avisa o usuário e devolve JSON
+
+    Configuração: rodar como SYSTEM, PowerShell 64 bits.
+    Saída: JSON em uma linha (coluna "Remediation output" / "Post-remediation detection output").
+#>
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# ----------------------------- CONFIGURAÇÕES --------------------------------
+$WarningMinutes  = 10     # tempo entre o aviso e o fechamento do Office
+$MaxWaitMinutes  = 40     # tempo máximo esperando a atualização concluir
+$CompanyName     = 'TI'   # assinatura das mensagens
+
+$MinimumBuild = @{        # mesmo bloco opcional do script de detecção
+    # 'MonthlyEnterprise' = ''
+}
+
+$OfficeProcesses = 'WINWORD','EXCEL','POWERPNT','OUTLOOK','MSACCESS','MSPUB',
+                   'ONENOTE','VISIO','WINPROJ','lync','GROOVE'
+
+# ------------------- mesma lógica de identificação da detecção ---------------
+$Channels = @{
+    '492350f6-3a01-4f97-b9c0-c7c6ddf67d60' = @('Current',                        'Current')
+    '64256afe-f5d9-4f86-8936-8840a6a4f5be' = @('Current Preview',                'CurrentPreview')
+    '5440fd1f-7ecb-4221-8110-145efaa6372f' = @('Beta',                           'BetaChannel')
+    '55336b82-a18d-4dd6-b5f6-9e5095c314a6' = @('Monthly Enterprise',             'MonthlyEnterprise')
+    '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114' = @('Semi-Annual Enterprise',         'SemiAnnual')
+    'b8f9b850-328d-4355-9145-c59439a0c4cf' = @('Semi-Annual Enterprise Preview', 'SemiAnnualPreview')
+    'f2e724c1-748f-4b47-8fb8-8e0d210e9208' = @('LTSC 2019',                      'PerpetualVL2019')
+    '5030841d-c919-4594-8d2d-84ae4f96e58e' = @('LTSC 2021',                      'PerpetualVL2021')
+    '7983bac0-e531-40cf-be00-fd24fe66619c' = @('LTSC 2024',                      'PerpetualVL2024')
+}
+$PolicyBranch = @{
+    'Current'              = '492350f6-3a01-4f97-b9c0-c7c6ddf67d60'
+    'FirstReleaseCurrent'  = '64256afe-f5d9-4f86-8936-8840a6a4f5be'
+    'InsiderFast'          = '5440fd1f-7ecb-4221-8110-145efaa6372f'
+    'MonthlyEnterprise'    = '55336b82-a18d-4dd6-b5f6-9e5095c314a6'
+    'Deferred'             = '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114'
+    'FirstReleaseDeferred' = 'b8f9b850-328d-4355-9145-c59439a0c4cf'
+}
+
+function Get-RegValue([string]$Path, [string]$Name) {
+    $key = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine','Registry64').OpenSubKey($Path)
+    if ($key) { $v = $key.GetValue($Name); $key.Close(); return $v }
+}
+
+function Resolve-ChannelGuid([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    foreach ($g in $Channels.Keys) { if ($Value -match $g) { return $g } }
+    if ($PolicyBranch.ContainsKey($Value)) { return $PolicyBranch[$Value] }
+}
+
+function Get-OfficeState {
+    $c2r = 'SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+    $pol = 'SOFTWARE\Policies\Microsoft\office\16.0\common\officeupdate'
+    $state = [ordered]@{
+        Computer = $env:COMPUTERNAME; Installed = $false; Channel = $null; ChannelId = $null
+        Version = $null; Latest = $null; Target = $null; NeedsUpdate = $false
+        Status = $null; Collected = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+    }
+    $state.Version = Get-RegValue $c2r 'VersionToReport'
+    if (-not $state.Version) { $state.Status = 'Office C2R nao encontrado'; return $state }
+    $state.Installed = $true
+
+    $guid = $null
+    foreach ($v in @((Get-RegValue $pol 'updatepath'), (Get-RegValue $pol 'updatebranch'),
+                     (Get-RegValue $c2r 'UpdateChannel'), (Get-RegValue $c2r 'UnmanagedUpdateURL'),
+                     (Get-RegValue $c2r 'CDNBaseUrl'))) {
+        $guid = Resolve-ChannelGuid $v
+        if ($guid) { break }
+    }
+    if ($guid) {
+        $state.Channel   = $Channels[$guid][0]
+        $state.ChannelId = $Channels[$guid][1]
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $releases = Invoke-RestMethod -Uri 'https://clients.config.office.net/releases/v1.0/OfficeReleases' `
+                                          -UseBasicParsing -TimeoutSec 60
+            $latest = ($releases | Where-Object { $_.channelId -eq $state.ChannelId } | Select-Object -First 1).latestVersion
+            if ($latest -and $latest -notmatch '^16\.0\.') { $latest = "16.0.$latest" }
+            $state.Latest = $latest
+        } catch { }
+    }
+
+    $target = $state.Latest
+    $min = if ($state.ChannelId) { $MinimumBuild[$state.ChannelId] }
+    if ($min -and (-not $target -or [version]$min -gt [version]$target)) { $target = $min }
+    $state.Target = $target
+    $state.NeedsUpdate = (-not $target) -or ([version]$state.Version -lt [version]$target)
+    return $state
+}
+
+# ----------------------------- AVISO AO USUÁRIO ------------------------------
+function Send-UserMessage([string]$Text, [int]$Seconds = 300) {
+    # msg.exe envia para todas as sessões ativas (funciona rodando como SYSTEM)
+    $msg = Join-Path $env:SystemRoot 'System32\msg.exe'
+    if (Test-Path $msg) { & $msg * /TIME:$Seconds $Text 2>$null }
+}
+
+function Get-RunningOfficeApps {
+    Get-Process -Name $OfficeProcesses -ErrorAction SilentlyContinue
+}
+
+function Close-OfficeApps {
+    $procs = Get-RunningOfficeApps
+    if (-not $procs) { return }
+    # 1) tenta fechar de forma "educada" (o app pode pedir para salvar)
+    $procs | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+    Start-Sleep -Seconds 45
+    # 2) o que sobrou é encerrado
+    Get-RunningOfficeApps | Stop-Process -Force
+}
+
+# ------------------------------- MAIN ---------------------------------------
+$s = Get-OfficeState
+if (-not $s.Installed) { $s.Status = 'Office C2R nao encontrado'; Write-Output ($s | ConvertTo-Json -Compress); exit 0 }
+if (-not $s.NeedsUpdate) { $s.Status = 'Ja atualizado'; Write-Output ($s | ConvertTo-Json -Compress); exit 0 }
+
+$c2rClient = "$env:ProgramFiles\Common Files\microsoft shared\ClickToRun\OfficeC2RClient.exe"
+if (-not (Test-Path $c2rClient)) {
+    $s.Status = 'OfficeC2RClient.exe nao encontrado'
+    Write-Output ($s | ConvertTo-Json -Compress); exit 1
+}
+
+$before = $s.Version
+
+# 1) Aviso + contagem regressiva (só se o Office estiver aberto)
+if (Get-RunningOfficeApps) {
+    Send-UserMessage ("[$CompanyName] Atualizacao de seguranca CRITICA do Microsoft Office.`n`n" +
+        "Salve seus arquivos agora. Word, Excel, Outlook, PowerPoint e demais apps do Office " +
+        "serao FECHADOS automaticamente em $WarningMinutes minutos para concluir a atualizacao.`n`n" +
+        "Nao reabra o Office ate receber a mensagem de conclusao.") ($WarningMinutes * 60)
+    Start-Sleep -Seconds (($WarningMinutes - 1) * 60)
+    if (Get-RunningOfficeApps) {
+        Send-UserMessage "[$CompanyName] O Office sera fechado em 1 minuto. Salve seus arquivos." 60
+        Start-Sleep -Seconds 60
+    }
+}
+
+# 2) Fecha o Office
+Close-OfficeApps
+
+# 3) Dispara a atualização
+$c2rArgs = @('/update', 'user', 'displaylevel=false', 'forceappshutdown=true')
+if ($s.Target) { $c2rArgs += "updatetoversion=$($s.Target)" }
+Start-Process -FilePath $c2rClient -ArgumentList $c2rArgs -Wait
+
+# 4) Aguarda a versão mudar
+$deadline = (Get-Date).AddMinutes($MaxWaitMinutes)
+do {
+    Start-Sleep -Seconds 30
+    $current = Get-RegValue 'SOFTWARE\Microsoft\Office\ClickToRun\Configuration' 'VersionToReport'
+    $done = $false
+    if ($current) {
+        $done = if ($s.Target) { [version]$current -ge [version]$s.Target } else { [version]$current -gt [version]$before }
+    }
+} until ($done -or (Get-Date) -gt $deadline)
+
+$s.Version   = $current
+$s.Collected = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+
+if ($done) {
+    $s.Status = "Atualizado de $before para $current"
+    $s.NeedsUpdate = $false
+    Send-UserMessage "[$CompanyName] Atualizacao do Office concluida. Voce ja pode abrir seus aplicativos novamente." 600
+    Write-Output ($s | ConvertTo-Json -Compress)
+    exit 0
+} else {
+    $s.Status = "Timeout: versao continua $current (alvo $($s.Target)). Update pode seguir em segundo plano."
+    Send-UserMessage "[$CompanyName] A atualizacao do Office ainda esta em andamento. Voce pode reabrir o Office; ele podera ser fechado novamente para concluir." 600
+    Write-Output ($s | ConvertTo-Json -Compress)
+    exit 1
+}
