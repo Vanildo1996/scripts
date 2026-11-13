@@ -1,0 +1,156 @@
+<#
+.SYNOPSIS
+    Remove resquícios de inscrição MDM (Intune) e força um novo enrollment.
+    Feito para rodar via SCCM (Package/Program, Application ou Run Script) como SYSTEM.
+
+.NOTES
+    - Distribua APENAS para a collection das máquinas com problema.
+      Em máquinas saudáveis, o script derruba a inscrição atual e cria outra.
+    - Antes de rodar, apague o registro antigo da máquina no portal do Intune, se ele existir.
+    - Log:    C:\Windows\Temp\Repair-IntuneEnrollment.log
+    - Backup: C:\Windows\Temp\IntuneEnrollBackup_<data>\  (arquivos .reg)
+    - Códigos de saída: 0 = enrollment OK | 1 = falha | 2 = máquina não está Entra joined
+#>
+
+# ---------------- CONFIGURAÇÃO ----------------
+$TempoEsperaSegundos = 180   # quanto tempo esperar pela nova inscrição
+# ----------------------------------------------
+
+# --- Garante execução em PowerShell 64 bits (SCCM pode chamar 32 bits) ---
+if ($env:PROCESSOR_ARCHITEW6432 -eq 'AMD64') {
+    $ps64 = "$env:WINDIR\SysNative\WindowsPowerShell\v1.0\powershell.exe"
+    & $ps64 -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
+    exit $LASTEXITCODE
+}
+
+$LogFile    = "$env:WINDIR\Temp\Repair-IntuneEnrollment.log"
+$BackupPath = "$env:WINDIR\Temp\IntuneEnrollBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+function Write-Log {
+    param([string]$Msg, [string]$Level = 'INFO')
+    $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Msg
+    Add-Content -Path $LogFile -Value $line
+    Write-Output $line
+}
+
+Write-Log "===== Início - $env:COMPUTERNAME ====="
+
+# --- 1. Verifica se a máquina está Hybrid / Entra joined ---
+$dsreg = dsregcmd /status
+$aadJoined = ($dsreg | Select-String 'AzureAdJoined\s*:\s*YES') -ne $null
+$prt       = ($dsreg | Select-String 'AzureAdPrt\s*:\s*YES') -ne $null
+Write-Log "AzureAdJoined=$aadJoined | AzureAdPrt=$prt"
+
+if (-not $aadJoined) {
+    Write-Log "Máquina não está Entra joined. Resolva o Hybrid Join antes do enrollment." 'ERRO'
+    exit 2
+}
+
+# --- 2. Localiza inscrições MDM antigas (ProviderID = MS DM Server) ---
+$enrollRoot = 'HKLM:\SOFTWARE\Microsoft\Enrollments'
+$guids = Get-ChildItem $enrollRoot -ErrorAction SilentlyContinue |
+    Where-Object { $_.PSChildName -match '^\{?[0-9A-Fa-f\-]{36}\}?$' } |
+    Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProviderID -eq 'MS DM Server' } |
+    Select-Object -ExpandProperty PSChildName
+
+if (-not $guids) {
+    Write-Log "Nenhuma inscrição MDM antiga encontrada. Seguindo direto para o enrollment."
+}
+else {
+    New-Item -Path $BackupPath -ItemType Directory -Force | Out-Null
+
+    foreach ($guid in $guids) {
+        Write-Log "Limpando inscrição $guid"
+
+        $keys = @(
+            "HKLM\SOFTWARE\Microsoft\Enrollments\$guid",
+            "HKLM\SOFTWARE\Microsoft\Enrollments\Status\$guid",
+            "HKLM\SOFTWARE\Microsoft\EnterpriseResourceManager\Tracked\$guid",
+            "HKLM\SOFTWARE\Microsoft\PolicyManager\AdmxInstalled\$guid",
+            "HKLM\SOFTWARE\Microsoft\PolicyManager\Providers\$guid",
+            "HKLM\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts\$guid",
+            "HKLM\SOFTWARE\Microsoft\Provisioning\OMADM\Logger\$guid",
+            "HKLM\SOFTWARE\Microsoft\Provisioning\OMADM\Sessions\$guid"
+        )
+
+        $i = 0
+        foreach ($key in $keys) {
+            $psKey = "Registry::$key"
+            if (Test-Path $psKey) {
+                $i++
+                $bkp = Join-Path $BackupPath ("{0}_{1}.reg" -f $guid.Trim('{}'), $i)
+                reg export $key $bkp /y | Out-Null
+                Remove-Item -Path $psKey -Recurse -Force -ErrorAction SilentlyContinue
+                if (Test-Path $psKey) { Write-Log "Falha ao remover $key" 'AVISO' }
+                else { Write-Log "Removido: $key (backup: $bkp)" }
+            }
+        }
+
+        # Tarefas agendadas do EnterpriseMgmt
+        try {
+            $tasks = Get-ScheduledTask -TaskPath "\Microsoft\Windows\EnterpriseMgmt\$guid\*" -ErrorAction SilentlyContinue
+            foreach ($t in $tasks) {
+                Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false
+                Write-Log "Tarefa removida: $($t.TaskPath)$($t.TaskName)"
+            }
+            $svc = New-Object -ComObject Schedule.Service
+            $svc.Connect()
+            $svc.GetFolder('\Microsoft\Windows\EnterpriseMgmt').DeleteFolder($guid, 0)
+            Write-Log "Pasta de tarefas removida: \Microsoft\Windows\EnterpriseMgmt\$guid"
+        }
+        catch {
+            Write-Log "Pasta de tarefas $guid não encontrada ou já removida."
+        }
+    }
+}
+
+# --- 3. Remove certificado antigo do Intune ---
+Get-ChildItem Cert:\LocalMachine\My |
+    Where-Object { $_.Issuer -match 'Microsoft Intune MDM Device CA' } |
+    ForEach-Object {
+        Write-Log "Removendo certificado Intune: $($_.Subject) | Thumbprint $($_.Thumbprint)"
+        Remove-Item $_.PSPath -Force
+    }
+
+# --- 4. Força novo enrollment ---
+Write-Log "Disparando enrollment (AutoEnrollMDMUsingAADDeviceCredential)"
+$proc = Start-Process -FilePath "$env:WINDIR\System32\deviceenroller.exe" `
+    -ArgumentList '/c /AutoEnrollMDMUsingAADDeviceCredential' -Wait -PassThru -WindowStyle Hidden
+Write-Log "deviceenroller.exe exit code: $($proc.ExitCode)"
+
+# Também dispara a avaliação de política do cliente SCCM (co-management)
+try {
+    Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'SMS_Client' -MethodName 'TriggerSchedule' `
+        -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000021}' } | Out-Null
+    Write-Log "Machine Policy Retrieval do SCCM disparado."
+}
+catch {
+    Write-Log "Não foi possível disparar política do SCCM: $($_.Exception.Message)" 'AVISO'
+}
+
+# --- 5. Aguarda e valida ---
+$fim = (Get-Date).AddSeconds($TempoEsperaSegundos)
+$ok = $false
+do {
+    Start-Sleep -Seconds 15
+    $novo = Get-ChildItem $enrollRoot -ErrorAction SilentlyContinue | Where-Object {
+        $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+        $p.ProviderID -eq 'MS DM Server' -and $p.EnrollmentState -eq 1
+    }
+    $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Issuer -match 'Microsoft Intune MDM Device CA' }
+    if ($novo -and $cert) { $ok = $true }
+} while (-not $ok -and (Get-Date) -lt $fim)
+
+if ($ok) {
+    Write-Log "Enrollment concluído. Nova inscrição: $($novo.PSChildName -join ', ')"
+    Write-Log "===== Fim (sucesso) ====="
+    exit 0
+}
+else {
+    Write-Log "Enrollment não confirmado em $TempoEsperaSegundos s. Consulte o Visualizador de Eventos: DeviceManagement-Enterprise-Diagnostics-Provider > Admin" 'ERRO'
+    Get-WinEvent -LogName 'Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin' -MaxEvents 10 -ErrorAction SilentlyContinue |
+        Where-Object { $_.LevelDisplayName -in 'Error', 'Erro', 'Warning', 'Aviso' } |
+        ForEach-Object { Write-Log ("Evento {0}: {1}" -f $_.Id, ($_.Message -replace '\s+', ' ')) 'ERRO' }
+    Write-Log "===== Fim (falha) ====="
+    exit 1
+}
