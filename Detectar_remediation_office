@@ -1,0 +1,112 @@
+﻿<#
+.SYNOPSIS
+    Intune Remediation - DETECTION
+    Identifica o canal e a versão do Microsoft 365 Apps, consulta a última
+    versão publicada pela Microsoft para esse canal e decide se precisa atualizar.
+
+    exit 0 = atualizado (não roda remediação)
+    exit 1 = desatualizado ou não foi possível consultar (roda remediação)
+
+    Saída: JSON em uma linha (coluna "Pre-remediation detection output").
+    Configuração: rodar como SYSTEM, PowerShell 64 bits.
+#>
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# ---------------------------------------------------------------------------
+# OPCIONAL: build mínimo que corrige o zero-day, por canal (veja o boletim/CVE).
+# Se preenchido, a máquina só é considerada OK quando estiver >= esse build,
+# mesmo que a API retorne outra coisa. Deixe vazio para usar só a API.
+# Ex.: 'MonthlyEnterprise' = '16.0.18025.20214'
+# ---------------------------------------------------------------------------
+$MinimumBuild = @{
+    # 'Current'           = ''
+    # 'MonthlyEnterprise' = ''
+    # 'SemiAnnual'        = ''
+}
+
+$Channels = @{
+    '492350f6-3a01-4f97-b9c0-c7c6ddf67d60' = @('Current',                        'Current')
+    '64256afe-f5d9-4f86-8936-8840a6a4f5be' = @('Current Preview',                'CurrentPreview')
+    '5440fd1f-7ecb-4221-8110-145efaa6372f' = @('Beta',                           'BetaChannel')
+    '55336b82-a18d-4dd6-b5f6-9e5095c314a6' = @('Monthly Enterprise',             'MonthlyEnterprise')
+    '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114' = @('Semi-Annual Enterprise',         'SemiAnnual')
+    'b8f9b850-328d-4355-9145-c59439a0c4cf' = @('Semi-Annual Enterprise Preview', 'SemiAnnualPreview')
+    'f2e724c1-748f-4b47-8fb8-8e0d210e9208' = @('LTSC 2019',                      'PerpetualVL2019')
+    '5030841d-c919-4594-8d2d-84ae4f96e58e' = @('LTSC 2021',                      'PerpetualVL2021')
+    '7983bac0-e531-40cf-be00-fd24fe66619c' = @('LTSC 2024',                      'PerpetualVL2024')
+}
+$PolicyBranch = @{
+    'Current'              = '492350f6-3a01-4f97-b9c0-c7c6ddf67d60'
+    'FirstReleaseCurrent'  = '64256afe-f5d9-4f86-8936-8840a6a4f5be'
+    'InsiderFast'          = '5440fd1f-7ecb-4221-8110-145efaa6372f'
+    'MonthlyEnterprise'    = '55336b82-a18d-4dd6-b5f6-9e5095c314a6'
+    'Deferred'             = '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114'
+    'FirstReleaseDeferred' = 'b8f9b850-328d-4355-9145-c59439a0c4cf'
+}
+
+function Get-RegValue([string]$Path, [string]$Name) {
+    $key = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine','Registry64').OpenSubKey($Path)
+    if ($key) { $v = $key.GetValue($Name); $key.Close(); return $v }
+}
+
+function Resolve-ChannelGuid([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    foreach ($g in $Channels.Keys) { if ($Value -match $g) { return $g } }
+    if ($PolicyBranch.ContainsKey($Value)) { return $PolicyBranch[$Value] }
+}
+
+function Get-OfficeState {
+    $c2r = 'SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+    $pol = 'SOFTWARE\Policies\Microsoft\office\16.0\common\officeupdate'
+    $state = [ordered]@{
+        Computer = $env:COMPUTERNAME; Installed = $false; Channel = $null; ChannelId = $null
+        Version = $null; Latest = $null; Target = $null; NeedsUpdate = $false
+        Status = $null; Collected = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+    }
+    $state.Version = Get-RegValue $c2r 'VersionToReport'
+    if (-not $state.Version) { $state.Status = 'Office C2R nao encontrado'; return $state }
+    $state.Installed = $true
+
+    $guid = $null
+    foreach ($v in @((Get-RegValue $pol 'updatepath'), (Get-RegValue $pol 'updatebranch'),
+                     (Get-RegValue $c2r 'UpdateChannel'), (Get-RegValue $c2r 'UnmanagedUpdateURL'),
+                     (Get-RegValue $c2r 'CDNBaseUrl'))) {
+        $guid = Resolve-ChannelGuid $v
+        if ($guid) { break }
+    }
+    if (-not $guid) { $state.Status = 'Canal nao identificado'; $state.NeedsUpdate = $true; return $state }
+    $state.Channel   = $Channels[$guid][0]
+    $state.ChannelId = $Channels[$guid][1]
+
+    # Última versão publicada pela Microsoft para o canal
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $releases = Invoke-RestMethod -Uri 'https://clients.config.office.net/releases/v1.0/OfficeReleases' `
+                                      -UseBasicParsing -TimeoutSec 60
+        $latest = ($releases | Where-Object { $_.channelId -eq $state.ChannelId } | Select-Object -First 1).latestVersion
+        if ($latest -and $latest -notmatch '^16\.0\.') { $latest = "16.0.$latest" }
+        $state.Latest = $latest
+    } catch { }
+
+    $target = $state.Latest
+    $min = $MinimumBuild[$state.ChannelId]
+    if ($min -and (-not $target -or [version]$min -gt [version]$target)) { $target = $min }
+    $state.Target = $target
+
+    if (-not $target) {
+        $state.Status = 'Falha ao consultar ultima versao - forcando update'
+        $state.NeedsUpdate = $true
+    } elseif ([version]$state.Version -lt [version]$target) {
+        $state.Status = 'Desatualizado'
+        $state.NeedsUpdate = $true
+    } else {
+        $state.Status = 'Atualizado'
+    }
+    return $state
+}
+
+# ------------------------------- MAIN ---------------------------------------
+$s = Get-OfficeState
+Write-Output ($s | ConvertTo-Json -Compress)
+if ($s.Installed -and $s.NeedsUpdate) { exit 1 } else { exit 0 }
