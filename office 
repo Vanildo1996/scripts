@@ -1,0 +1,115 @@
+<#
+.SYNOPSIS
+    Intune Remediation - Detection script
+    Detecta o canal de atualizacao e a versao do Microsoft 365 Apps (Click-to-Run)
+    e retorna o resultado em JSON (uma linha) para a coluna
+    "Pre-remediation detection output" da console do Intune.
+
+.NOTES
+    - Rodar como SYSTEM, em PowerShell 64 bits ("Run script in 64-bit PowerShell" = Yes)
+    - Sempre sai com exit 0 (somente inventario, nao dispara remediacao)
+    - O Intune guarda no maximo 2048 caracteres de saida; o JSON fica bem abaixo disso
+#>
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# Mapa GUID -> nome do canal
+$Channels = @{
+    '492350f6-3a01-4f97-b9c0-c7c6ddf67d60' = 'Current'
+    '64256afe-f5d9-4f86-8936-8840a6a4f5be' = 'Current Preview'
+    '5440fd1f-7ecb-4221-8110-145efaa6372f' = 'Beta'
+    '55336b82-a18d-4dd6-b5f6-9e5095c314a6' = 'Monthly Enterprise'
+    '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114' = 'Semi-Annual Enterprise'
+    'b8f9b850-328d-4355-9145-c59439a0c4cf' = 'Semi-Annual Enterprise Preview'
+    'f2e724c1-748f-4b47-8fb8-8e0d210e9208' = 'LTSC 2019'
+    '5030841d-c919-4594-8d2d-84ae4f96e58e' = 'LTSC 2021'
+    '7983bac0-e531-40cf-be00-fd24fe66619c' = 'LTSC 2024'
+}
+
+# Nomes usados na policy "updatebranch" (GPO / Cloud Update)
+$PolicyBranch = @{
+    'Current'           = 'Current'
+    'FirstReleaseCurrent' = 'Current Preview'
+    'InsiderFast'       = 'Beta'
+    'MonthlyEnterprise' = 'Monthly Enterprise'
+    'Deferred'          = 'Semi-Annual Enterprise'
+    'FirstReleaseDeferred' = 'Semi-Annual Enterprise Preview'
+}
+
+function Get-RegValue {
+    param([string]$Path, [string]$Name)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
+    $key  = $base.OpenSubKey($Path)
+    if ($key) { $v = $key.GetValue($Name); $key.Close(); return $v }
+    return $null
+}
+
+function Resolve-Channel {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    foreach ($guid in $Channels.Keys) {
+        if ($Value -match $guid) { return $Channels[$guid] }
+    }
+    if ($PolicyBranch.ContainsKey($Value)) { return $PolicyBranch[$Value] }
+    return "Desconhecido ($Value)"
+}
+
+$c2r = 'SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+$pol = 'SOFTWARE\Policies\Microsoft\office\16.0\common\officeupdate'
+
+$version = Get-RegValue $c2r 'VersionToReport'
+
+if (-not $version) {
+    $result = [ordered]@{
+        Computer  = $env:COMPUTERNAME
+        Installed = $false
+        Channel   = $null
+        Version   = $null
+        Build     = $null
+        Source    = $null
+        Platform  = $null
+        Products  = $null
+        Collected = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+    }
+    Write-Output ($result | ConvertTo-Json -Compress)
+    exit 0
+}
+
+$policyBranchVal = Get-RegValue $pol 'updatebranch'
+$policyPathVal   = Get-RegValue $pol 'updatepath'
+$updateChannel   = Get-RegValue $c2r 'UpdateChannel'
+$unmanagedUrl    = Get-RegValue $c2r 'UnmanagedUpdateURL'
+$cdnBaseUrl      = Get-RegValue $c2r 'CDNBaseUrl'
+
+# Ordem de precedencia do canal efetivo
+$channel = $null; $source = $null
+foreach ($item in @(
+    @{ V = $policyBranchVal; S = 'Policy updatebranch' },
+    @{ V = $policyPathVal;   S = 'Policy updatepath'   },
+    @{ V = $updateChannel;   S = 'UpdateChannel'       },
+    @{ V = $unmanagedUrl;    S = 'UnmanagedUpdateURL'  },
+    @{ V = $cdnBaseUrl;      S = 'CDNBaseUrl'          }
+)) {
+    $resolved = Resolve-Channel $item.V
+    if ($resolved) { $channel = $resolved; $source = $item.S; break }
+}
+
+# Build no formato que a Microsoft publica (ex.: 18129.20158)
+$build = ($version -split '\.')[2..3] -join '.'
+
+$result = [ordered]@{
+    Computer   = $env:COMPUTERNAME
+    Installed  = $true
+    Channel    = $channel
+    Version    = $version
+    Build      = $build
+    Source     = $source
+    CDNChannel = Resolve-Channel $cdnBaseUrl
+    Platform   = Get-RegValue $c2r 'Platform'
+    Products   = Get-RegValue $c2r 'ProductReleaseIds'
+    Language   = Get-RegValue $c2r 'ClientCulture'
+    Collected  = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+}
+
+Write-Output ($result | ConvertTo-Json -Compress)
+exit 0
