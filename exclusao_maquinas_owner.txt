@@ -1,0 +1,199 @@
+<#
+.SYNOPSIS
+    Para cada máquina do TXT:
+      1. Identifica o usuário que realmente usa a máquina (novo owner).
+      2. Intune: troca o Usuário Primário do analista para esse usuário (ou só remove, se não achar ninguém).
+      3. Entra ID: adiciona esse usuário como Registered Owner e remove o analista
+         (é isso que libera a cota do erro 801c000e).
+
+    Como o novo usuário é definido (nesta ordem):
+      a) 2ª coluna do TXT, se informada:   MAQUINA01;joao.silva@empresa.com
+      b) Usuário primário atual no Intune (se não for o analista)
+      c) Último usuário que fez logon na máquina (usersLoggedOn do Intune), se não for o analista
+      d) Ninguém encontrado -> apenas remove o analista (máquina fica sem owner)
+
+.PERMISSÕES (Application) no App Registration, com Admin Consent:
+    - DeviceManagementManagedDevices.ReadWrite.All
+    - User.Read.All
+    - Directory.ReadWrite.All
+
+.FORMATO DO TXT (uma máquina por linha; a 2ª coluna é opcional)
+    MAQUINA01
+    MAQUINA02;maria.souza@empresa.com
+#>
+
+# ========================= CONFIGURAÇÃO =========================
+$TenantId     = "SEU-TENANT-ID"
+$ClientId     = "SEU-CLIENT-ID"
+$ClientSecret = "SEU-CLIENT-SECRET"        # Prefira $env:GRAPH_SECRET ou um cofre
+
+$UserUPN         = "analista@empresa.com"  # UPN do analista a ser removido
+$ArquivoMaquinas = ".\maquinas.txt"
+
+$Simular              = $true    # $true = só mostra o que faria | $false = executa
+$AjustarOwnerEntra    = $true    # Adiciona novo owner e remove o analista no Entra
+$AjustarPrimarioIntune = $true   # Troca/remove o usuário primário no Intune
+
+$ArquivoLog = ".\resultado_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+# ================================================================
+
+$ErrorActionPreference = "Stop"
+$Graph = "https://graph.microsoft.com"
+$GuidVazio = "00000000-0000-0000-0000-000000000000"
+
+function Get-GraphToken {
+    $body = @{
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        scope         = "$Graph/.default"
+        grant_type    = "client_credentials"
+    }
+    (Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Body $body).access_token
+}
+
+function Invoke-Graph {
+    param([string]$Method = "GET", [string]$Uri, $Body)
+    $params = @{
+        Method  = $Method
+        Uri     = $Uri
+        Headers = @{ Authorization = "Bearer $script:Token"; ConsistencyLevel = "eventual" }
+    }
+    if ($Body) {
+        $params.Body        = ($Body | ConvertTo-Json -Depth 5)
+        $params.ContentType = "application/json"
+    }
+    Invoke-RestMethod @params
+}
+
+$script:CacheUsuarios = @{}
+function Get-UsuarioPorUPN([string]$upn) {
+    if (-not $script:CacheUsuarios.ContainsKey($upn)) {
+        $script:CacheUsuarios[$upn] = Invoke-Graph -Uri "$Graph/v1.0/users/$([uri]::EscapeDataString($upn))?`$select=id,userPrincipalName"
+    }
+    $script:CacheUsuarios[$upn]
+}
+function Get-UsuarioPorId([string]$id) {
+    Invoke-Graph -Uri "$Graph/v1.0/users/$id`?`$select=id,userPrincipalName"
+}
+
+# ------------------------- Validações -------------------------
+if (-not (Test-Path $ArquivoMaquinas)) { throw "Arquivo não encontrado: $ArquivoMaquinas" }
+$linhas = Get-Content $ArquivoMaquinas | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith("#") }
+if (-not $linhas) { throw "O arquivo $ArquivoMaquinas está vazio." }
+
+Write-Host "Obtendo token..." -ForegroundColor Cyan
+$script:Token = Get-GraphToken
+
+$analista = Get-UsuarioPorUPN $UserUPN
+Write-Host "Analista: $($analista.userPrincipalName) ($($analista.id))" -ForegroundColor Cyan
+if ($Simular) { Write-Host "*** MODO SIMULAÇÃO - nada será alterado. Mude `$Simular para `$false para executar ***" -ForegroundColor Yellow }
+
+$resultados = foreach ($l in $linhas) {
+    $partes   = $l -split '[;,]'
+    $nome     = $partes[0].Trim()
+    $upnTxt   = if ($partes.Count -gt 1) { $partes[1].Trim() } else { "" }
+
+    $linha = [ordered]@{
+        Maquina = $nome; NovoUsuario = ""; OrigemNovoUsuario = ""
+        Intune = ""; EntraAddOwner = ""; EntraRemoveAnalista = ""; Erro = ""
+    }
+
+    try {
+        $nomeFiltro = $nome.Replace("'", "''")
+        $devices = (Invoke-Graph -Uri "$Graph/beta/deviceManagement/managedDevices?`$filter=deviceName eq '$nomeFiltro'&`$select=id,deviceName,azureADDeviceId,usersLoggedOn").value
+
+        if (-not $devices) { $linha.Intune = "Não encontrada no Intune"; [pscustomobject]$linha; continue }
+        if (@($devices).Count -gt 1) { $linha.Erro = "Mais de um registro com esse nome no Intune - verifique manualmente"; [pscustomobject]$linha; continue }
+
+        $d = @($devices)[0]
+        $primarios = @((Invoke-Graph -Uri "$Graph/beta/deviceManagement/managedDevices/$($d.id)/users").value)
+
+        # ---------- Define o novo usuário ----------
+        $novo = $null
+        if ($upnTxt) {
+            $novo = Get-UsuarioPorUPN $upnTxt; $linha.OrigemNovoUsuario = "TXT"
+        }
+        elseif ($primarios | Where-Object { $_.id -ne $analista.id }) {
+            $p = $primarios | Where-Object { $_.id -ne $analista.id } | Select-Object -First 1
+            $novo = [pscustomobject]@{ id = $p.id; userPrincipalName = $p.userPrincipalName }; $linha.OrigemNovoUsuario = "Primário atual"
+        }
+        else {
+            $ultimo = $d.usersLoggedOn | Where-Object { $_.userId -and $_.userId -ne $analista.id } |
+                      Sort-Object lastLogOnDateTime -Descending | Select-Object -First 1
+            if ($ultimo) {
+                try { $novo = Get-UsuarioPorId $ultimo.userId; $linha.OrigemNovoUsuario = "Último logon ($($ultimo.lastLogOnDateTime))" } catch {}
+            }
+        }
+        if ($novo -and $novo.id -eq $analista.id) { $novo = $null }
+        $linha.NovoUsuario = if ($novo) { $novo.userPrincipalName } else { "(nenhum encontrado)" }
+
+        # ---------- Intune: usuário primário ----------
+        if ($AjustarPrimarioIntune) {
+            if ($primarios.id -contains $analista.id) {
+                if (-not $Simular) {
+                    Invoke-Graph -Method DELETE -Uri "$Graph/beta/deviceManagement/managedDevices('$($d.id)')/users/`$ref" | Out-Null
+                    if ($novo) {
+                        Invoke-Graph -Method POST -Uri "$Graph/beta/deviceManagement/managedDevices('$($d.id)')/users/`$ref" `
+                            -Body @{ "@odata.id" = "$Graph/beta/users/$($novo.id)" } | Out-Null
+                    }
+                }
+                $acao = if ($novo) { "Trocado para $($novo.userPrincipalName)" } else { "Analista removido (sem primário)" }
+                $linha.Intune = if ($Simular) { "[SIMULAÇÃO] $acao" } else { $acao }
+            } else {
+                $atual = if ($primarios) { ($primarios.userPrincipalName -join ",") } else { "nenhum" }
+                $linha.Intune = "Analista não era primário (atual: $atual)"
+            }
+        }
+
+        # ---------- Entra ID: registered owner ----------
+        if ($AjustarOwnerEntra) {
+            if (-not $d.azureADDeviceId -or $d.azureADDeviceId -eq $GuidVazio) {
+                $linha.EntraRemoveAnalista = "Sem vínculo com o Entra"
+            } else {
+                $entraDev = (Invoke-Graph -Uri "$Graph/v1.0/devices?`$filter=deviceId eq '$($d.azureADDeviceId)'&`$select=id,displayName").value | Select-Object -First 1
+                if (-not $entraDev) {
+                    $linha.EntraRemoveAnalista = "Não encontrada no Entra"
+                } else {
+                    $donos = @((Invoke-Graph -Uri "$Graph/v1.0/devices/$($entraDev.id)/registeredOwners?`$select=id,userPrincipalName").value)
+
+                    # 1) Adiciona o novo owner primeiro (para a máquina não ficar sem dono)
+                    if ($novo) {
+                        if ($donos.id -contains $novo.id) {
+                            $linha.EntraAddOwner = "Já era owner"
+                        } else {
+                            if (-not $Simular) {
+                                Invoke-Graph -Method POST -Uri "$Graph/v1.0/devices/$($entraDev.id)/registeredOwners/`$ref" `
+                                    -Body @{ "@odata.id" = "$Graph/v1.0/directoryObjects/$($novo.id)" } | Out-Null
+                            }
+                            $linha.EntraAddOwner = if ($Simular) { "[SIMULAÇÃO] Adicionaria" } else { "Adicionado" }
+                        }
+                    } else {
+                        $linha.EntraAddOwner = "Nenhum usuário para adicionar"
+                    }
+
+                    # 2) Remove o analista
+                    if ($donos.id -contains $analista.id) {
+                        if (-not $Simular) {
+                            Invoke-Graph -Method DELETE -Uri "$Graph/v1.0/devices/$($entraDev.id)/registeredOwners/$($analista.id)/`$ref" | Out-Null
+                        }
+                        $linha.EntraRemoveAnalista = if ($Simular) { "[SIMULAÇÃO] Removeria" } else { "Removido" }
+                    } else {
+                        $linha.EntraRemoveAnalista = "Analista não era owner"
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $linha.Erro = $_.Exception.Message
+        if ($_.ErrorDetails.Message) { $linha.Erro += " | " + $_.ErrorDetails.Message }
+    }
+
+    $cor = if ($linha.Erro) { "Red" } elseif ("$($linha.Intune)$($linha.EntraRemoveAnalista)" -match "Removido|Removeria|Trocado|removido") { "Green" } else { "Gray" }
+    Write-Host ("{0,-18} Novo: {1,-30} | Intune: {2} | Entra: {3} / {4} {5}" -f `
+        $nome, $linha.NovoUsuario, $linha.Intune, $linha.EntraAddOwner, $linha.EntraRemoveAnalista, $linha.Erro) -ForegroundColor $cor
+    [pscustomobject]$linha
+}
+
+$resultados | Export-Csv -Path $ArquivoLog -NoTypeInformation -Encoding UTF8 -Delimiter ";"
+Write-Host "`nLog salvo em: $ArquivoLog" -ForegroundColor Cyan
